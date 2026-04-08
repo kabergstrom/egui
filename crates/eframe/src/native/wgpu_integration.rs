@@ -1012,6 +1012,7 @@ fn render_immediate_viewport(
             .map(|(id, viewport)| (*id, viewport.info.clone()))
             .collect();
         input.time = Some(beginning.elapsed().as_secs_f64());
+
         input
     };
 
@@ -1060,13 +1061,24 @@ fn render_immediate_viewport(
     }
 
     let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+
+    let mut screenshot_commands = vec![];
+    viewport.actions_requested.retain(|cmd| {
+        if let ActionRequested::Screenshot(info) = cmd {
+            screenshot_commands.push(info.clone());
+            false
+        } else {
+            true
+        }
+    });
+
     painter.paint_and_update_textures(
         ids.this,
         pixels_per_point,
         [0.0, 0.0, 0.0, 0.0],
         &clipped_primitives,
         &textures_delta,
-        vec![],
+        screenshot_commands,
     );
 
     egui_winit.handle_platform_output(window, platform_output);
