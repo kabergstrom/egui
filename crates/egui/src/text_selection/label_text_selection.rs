@@ -4,7 +4,7 @@ use emath::TSTransform;
 
 use crate::{
     Context, CursorIcon, Event, Galley, Id, LayerId, Plugin, Pos2, Rect, Response, Ui,
-    layers::ShapeIdx, text::CCursor, text_selection::CCursorRange,
+    ViewportId, layers::ShapeIdx, text::CCursor, text_selection::CCursorRange,
 };
 
 use super::{
@@ -81,6 +81,10 @@ pub struct LabelSelectionState {
     /// The current selection, if any.
     selection: Option<CurrentSelection>,
 
+    /// The viewport that owns the current selection.
+    /// Used to prevent other viewports' passes from clearing this selection.
+    selection_viewport: Option<ViewportId>,
+
     selection_bbox_last_frame: Rect,
     selection_bbox_this_frame: Rect,
 
@@ -110,6 +114,7 @@ impl Default for LabelSelectionState {
     fn default() -> Self {
         Self {
             selection: Default::default(),
+            selection_viewport: None,
             selection_bbox_last_frame: Rect::NOTHING,
             selection_bbox_this_frame: Rect::NOTHING,
             any_hovered: Default::default(),
@@ -150,12 +155,23 @@ impl Plugin for LabelSelectionState {
             ctx.set_cursor_icon(CursorIcon::Text);
         }
 
+        // If the selection lives in a different viewport, don't let this
+        // viewport's pass clear it. The owning viewport's pass will handle
+        // its own selection lifecycle.
+        let is_selection_viewport = self
+            .selection_viewport
+            .map_or(true, |vp| vp == ctx.viewport_id());
+        if !is_selection_viewport {
+            return;
+        }
+
         if !self.has_reached_primary || !self.has_reached_secondary {
             // We didn't see both cursors this frame,
             // maybe because they are outside the visible area (scrolling),
             // or one disappeared. In either case we will have horrible glitches, so let's just deselect.
 
             let prev_selection = self.selection.take();
+            self.selection_viewport = None;
             if let Some(selection) = prev_selection {
                 // This was the first frame of glitch, so hide the
                 // glitching by removing all painted selections:
@@ -196,6 +212,7 @@ impl Plugin for LabelSelectionState {
 
         if delected_everything {
             self.selection = None;
+            self.selection_viewport = None;
         }
 
         if ctx.input(|i| i.pointer.any_released()) {
@@ -216,6 +233,7 @@ impl LabelSelectionState {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+        self.selection_viewport = None;
     }
 
     fn copy_text(&mut self, new_galley_rect: Rect, galley: &Galley, cursor_range: &CCursorRange) {
@@ -553,6 +571,8 @@ impl LabelSelectionState {
                 let secondary_changed = Some(range.secondary) != old_range.map(|r| r.secondary);
 
                 selection.layer_id = response.layer_id;
+                // Selection may have moved to this viewport (e.g. user clicked a label here)
+                self.selection_viewport = Some(ui.ctx().viewport_id());
 
                 if primary_changed || !ui.style().interaction.multi_widget_text_select {
                     selection.primary =
@@ -570,6 +590,7 @@ impl LabelSelectionState {
                 }
             } else {
                 // Start of a new selection
+                self.selection_viewport = Some(ui.ctx().viewport_id());
                 self.selection = Some(CurrentSelection {
                     layer_id: response.layer_id,
                     primary: WidgetTextCursor::new(
