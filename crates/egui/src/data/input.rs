@@ -253,6 +253,14 @@ pub struct ViewportInfo {
     ///
     /// This should be the same as [`RawInput::focused`].
     pub focused: Option<bool>,
+
+    /// Is the window occluded (fully covered by other windows) on platforms
+    /// that report it (macOS)? Other platforms leave this `None`.
+    ///
+    /// `eframe` skips painting occluded immediate viewports to avoid the
+    /// `CAMetalLayer.nextDrawable` 1-second stall caused by macOS throttling
+    /// drawable allocation for non-visible surfaces.
+    pub occluded: Option<bool>,
 }
 
 impl ViewportInfo {
@@ -282,6 +290,7 @@ impl ViewportInfo {
             maximized: self.maximized,
             fullscreen: self.fullscreen,
             focused: self.focused,
+            occluded: self.occluded,
         }
     }
 
@@ -298,6 +307,7 @@ impl ViewportInfo {
             maximized,
             fullscreen,
             focused,
+            occluded,
         } = self;
 
         crate::Grid::new("viewport_info").show(ui, |ui| {
@@ -343,6 +353,10 @@ impl ViewportInfo {
 
             ui.label("Focused:");
             ui.label(opt_as_str(focused));
+            ui.end_row();
+
+            ui.label("Occluded:");
+            ui.label(opt_as_str(occluded));
             ui.end_row();
 
             fn opt_rect_as_string(v: &Option<Rect>) -> String {

@@ -1005,6 +1005,12 @@ fn render_immediate_viewport(
             return;
         };
         egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
+        // Query live occlusion state from the platform window. winit doesn't
+        // expose this (no `Window::is_occluded()`), so on macOS we ask
+        // AppKit's `NSWindow.occlusionState` directly. Doing the query at
+        // paint time (instead of caching `WindowEvent::Occluded`) eliminates
+        // the one-frame stall on transition into the occluded state.
+        viewport.info.occluded = query_window_occluded(window);
 
         let mut input = egui_winit.take_egui_input(window);
         input.viewports = viewports
@@ -1050,36 +1056,62 @@ fn render_immediate_viewport(
         return;
     };
 
-    {
-        profiling::scope!("set_window");
-        if let Err(err) = pollster::block_on(painter.set_window(ids.this, Some(window.clone()))) {
-            log::error!(
-                "when rendering viewport_id={:?}, set_window Error {err}",
-                ids.this
-            );
+    // Skip GPU work for occluded immediate viewports: on macOS the
+    // compositor stops allocating drawables to occluded surfaces, and
+    // `surface.get_current_texture()` (inside `paint_and_update_textures`)
+    // blocks for ~1s on `CAMetalLayer.nextDrawable`. Because the parent
+    // calls us synchronously inside its own frame, that stall freezes the
+    // entire app at ~1fps. The window stays alive — we still ran the user
+    // callback and `egui_ctx.run` above — we just don't try to present.
+    //
+    // Pending screenshot requests are an exception: when the user has
+    // explicitly asked for a frame capture (LLM tools, thumbnails) we run
+    // through paint so the screenshot machinery can complete.
+    let has_pending_screenshot = viewport
+        .actions_requested
+        .iter()
+        .any(|cmd| matches!(cmd, ActionRequested::Screenshot(_)));
+    let skip_paint = viewport.info.occluded == Some(true) && !has_pending_screenshot;
+
+    if skip_paint {
+        // Still drain screenshot-or-noop actions so they don't queue up.
+        viewport.actions_requested.retain(|cmd| {
+            !matches!(cmd, ActionRequested::Screenshot(_))
+        });
+    } else {
+        {
+            profiling::scope!("set_window");
+            if let Err(err) =
+                pollster::block_on(painter.set_window(ids.this, Some(window.clone())))
+            {
+                log::error!(
+                    "when rendering viewport_id={:?}, set_window Error {err}",
+                    ids.this
+                );
+            }
         }
+
+        let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+
+        let mut screenshot_commands = vec![];
+        viewport.actions_requested.retain(|cmd| {
+            if let ActionRequested::Screenshot(info) = cmd {
+                screenshot_commands.push(info.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        painter.paint_and_update_textures(
+            ids.this,
+            pixels_per_point,
+            [0.0, 0.0, 0.0, 0.0],
+            &clipped_primitives,
+            &textures_delta,
+            screenshot_commands,
+        );
     }
-
-    let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
-
-    let mut screenshot_commands = vec![];
-    viewport.actions_requested.retain(|cmd| {
-        if let ActionRequested::Screenshot(info) = cmd {
-            screenshot_commands.push(info.clone());
-            false
-        } else {
-            true
-        }
-    });
-
-    painter.paint_and_update_textures(
-        ids.this,
-        pixels_per_point,
-        [0.0, 0.0, 0.0, 0.0],
-        &clipped_primitives,
-        &textures_delta,
-        screenshot_commands,
-    );
 
     egui_winit.handle_platform_output(window, platform_output);
 
@@ -1090,6 +1122,37 @@ fn render_immediate_viewport(
         painter,
         viewport_from_window,
     );
+}
+
+/// Live occlusion query. Returns `Some(true)` when the OS has marked the
+/// window as fully hidden by other surfaces, `Some(false)` when visible,
+/// and `None` on platforms that don't expose occlusion (or when the
+/// window handle can't be resolved). Used to skip GPU presentation for
+/// occluded immediate viewports — see the comment in
+/// `render_immediate_viewport` for the macOS rationale.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)] // Required to project the AppKit NSView pointer.
+fn query_window_occluded(window: &Window) -> Option<bool> {
+    use objc2_app_kit::{NSView, NSWindowOcclusionState};
+    use raw_window_handle::RawWindowHandle;
+
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return None;
+    };
+    // SAFETY: AppKit hands out a retained NSView pointer; we treat it as
+    // a borrowed reference for the duration of this query (no lifetime
+    // extension, no retain/release). Called on the main thread, where
+    // AppKit objects may be touched.
+    let ns_view: &NSView = unsafe { &*appkit.ns_view.as_ptr().cast::<NSView>() };
+    let ns_window = ns_view.window()?;
+    let state = ns_window.occlusionState();
+    Some(!state.contains(NSWindowOcclusionState::Visible))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_window_occluded(_window: &Window) -> Option<bool> {
+    None
 }
 
 pub(crate) fn remove_viewports_not_in(
