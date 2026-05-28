@@ -1012,6 +1012,31 @@ fn render_immediate_viewport(
         // the one-frame stall on transition into the occluded state.
         viewport.info.occluded = query_window_occluded(window);
 
+        // Skip the entire pass for occluded immediate viewports — including
+        // the user callback and `egui_ctx.run`. We must not call `run` and
+        // then drop its `TexturesDelta`: the Context considers a returned
+        // delta delivered, so any glyph atlas slots first referenced this
+        // frame would never reach the GPU. Subsequent draws (on this
+        // viewport or any other sharing the Context's font atlas) would
+        // then sample garbage from those slots, rendering specific glyphs
+        // invisible.
+        //
+        // The original macOS rationale still holds: `show_viewport_immediate`
+        // calls us synchronously inside the parent's frame, and
+        // `surface.get_current_texture()` blocks for ~1s on
+        // `CAMetalLayer.nextDrawable` for occluded surfaces. Returning early
+        // here avoids that stall without touching texture state.
+        //
+        // Screenshot requests bypass the skip so explicit frame captures
+        // (LLM tools, thumbnails) keep working even while occluded.
+        let has_pending_screenshot = viewport
+            .actions_requested
+            .iter()
+            .any(|cmd| matches!(cmd, ActionRequested::Screenshot(_)));
+        if viewport.info.occluded == Some(true) && !has_pending_screenshot {
+            return;
+        }
+
         let mut input = egui_winit.take_egui_input(window);
         input.viewports = viewports
             .iter()
@@ -1056,62 +1081,36 @@ fn render_immediate_viewport(
         return;
     };
 
-    // Skip GPU work for occluded immediate viewports: on macOS the
-    // compositor stops allocating drawables to occluded surfaces, and
-    // `surface.get_current_texture()` (inside `paint_and_update_textures`)
-    // blocks for ~1s on `CAMetalLayer.nextDrawable`. Because the parent
-    // calls us synchronously inside its own frame, that stall freezes the
-    // entire app at ~1fps. The window stays alive — we still ran the user
-    // callback and `egui_ctx.run` above — we just don't try to present.
-    //
-    // Pending screenshot requests are an exception: when the user has
-    // explicitly asked for a frame capture (LLM tools, thumbnails) we run
-    // through paint so the screenshot machinery can complete.
-    let has_pending_screenshot = viewport
-        .actions_requested
-        .iter()
-        .any(|cmd| matches!(cmd, ActionRequested::Screenshot(_)));
-    let skip_paint = viewport.info.occluded == Some(true) && !has_pending_screenshot;
-
-    if skip_paint {
-        // Still drain screenshot-or-noop actions so they don't queue up.
-        viewport.actions_requested.retain(|cmd| {
-            !matches!(cmd, ActionRequested::Screenshot(_))
-        });
-    } else {
-        {
-            profiling::scope!("set_window");
-            if let Err(err) =
-                pollster::block_on(painter.set_window(ids.this, Some(window.clone())))
-            {
-                log::error!(
-                    "when rendering viewport_id={:?}, set_window Error {err}",
-                    ids.this
-                );
-            }
+    {
+        profiling::scope!("set_window");
+        if let Err(err) = pollster::block_on(painter.set_window(ids.this, Some(window.clone()))) {
+            log::error!(
+                "when rendering viewport_id={:?}, set_window Error {err}",
+                ids.this
+            );
         }
-
-        let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
-
-        let mut screenshot_commands = vec![];
-        viewport.actions_requested.retain(|cmd| {
-            if let ActionRequested::Screenshot(info) = cmd {
-                screenshot_commands.push(info.clone());
-                false
-            } else {
-                true
-            }
-        });
-
-        painter.paint_and_update_textures(
-            ids.this,
-            pixels_per_point,
-            [0.0, 0.0, 0.0, 0.0],
-            &clipped_primitives,
-            &textures_delta,
-            screenshot_commands,
-        );
     }
+
+    let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+
+    let mut screenshot_commands = vec![];
+    viewport.actions_requested.retain(|cmd| {
+        if let ActionRequested::Screenshot(info) = cmd {
+            screenshot_commands.push(info.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    painter.paint_and_update_textures(
+        ids.this,
+        pixels_per_point,
+        [0.0, 0.0, 0.0, 0.0],
+        &clipped_primitives,
+        &textures_delta,
+        screenshot_commands,
+    );
 
     egui_winit.handle_platform_output(window, platform_output);
 
